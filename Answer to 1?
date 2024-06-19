@@ -1,0 +1,104 @@
+from hcipy import *
+import numpy as np
+import matplotlib.pyplot as plt
+from skimage.restoration import unwrap_phase
+from image_sharpening import FocusDiversePhaseRetrieval, mft_rev, InstrumentConfiguration
+
+pupil_size = 10.12e-3  # 10.12 mm
+focal_length = 500e-3  # 500 mm
+wavelength = 650e-9  # 650 nm
+
+pupil_grid = make_pupil_grid(256, pupil_size)
+aperture = make_circular_aperture(pupil_size)
+telescope_pupil = aperture(pupil_grid)
+
+wavefront = Wavefront(telescope_pupil, wavelength=wavelength)
+focal_grid = make_focal_grid(q=16, num_airy=16, pupil_diameter=pupil_size, focal_length=focal_length, reference_wavelength=wavelength)
+prop_p2f = FraunhoferPropagator(pupil_grid, focal_grid, focal_length=focal_length)
+
+===
+
+def phase_to_m(phase, wv):
+    return phase * wv / (2 * np.pi)
+
+def p_to_delta(P, f, D):
+    return 8 * P * (f / D) ** 2
+
+def delta_to_p(delta, f, D):
+    return -1 * delta / (8 * (f / D) ** 2)
+===
+
+def generate_defocus_phase(influence_functions, defocus_amount):
+    return influence_functions[3] * defocus_amount
+
+influence_functions = make_zernike_basis(256, pupil_size, pupil_grid)
+
+===
+
+def evaluate_recovery(psf_list, distance_list, dx_list):
+    mp = FocusDiversePhaseRetrieval(psf_list, wavelength, dx_list, distance_list)
+    for _ in range(200):
+        psf_model = mp.step()
+    return psf_model
+
+def calculate_metrics(recovered_phase, original_phase, pupil_mask):
+    unwrapped_recovered = unwrap_phase(recovered_phase)
+    unwrapped_original = unwrap_phase(original_phase)
+
+    p2v_error = np.max(unwrapped_recovered) - np.min(unwrapped_recovered)
+    rms_error = np.sqrt(np.mean((unwrapped_recovered - unwrapped_original) ** 2))
+    return p2v_error, rms_error
+
+==
+
+def main():
+    defocus_range = np.linspace(-10e-3, 10e-3, 21)  # from -10 mm to 10 mm
+    results = []
+
+    for defocus_1 in defocus_range:
+        for defocus_2 in defocus_range:
+            for defocus_3 in defocus_range:
+                defocus_phase_1 = generate_defocus_phase(influence_functions, defocus_1)
+                defocus_phase_2 = generate_defocus_phase(influence_functions, defocus_2)
+                defocus_phase_3 = generate_defocus_phase(influence_functions, defocus_3)
+
+                wavefront_1 = Wavefront(telescope_pupil, wavelength=wavelength)
+                wavefront_1.electric_field = np.exp(1j * defocus_phase_1) * telescope_pupil
+
+                wavefront_2 = Wavefront(telescope_pupil, wavelength=wavelength)
+                wavefront_2.electric_field = np.exp(1j * defocus_phase_2) * telescope_pupil
+
+                wavefront_3 = Wavefront(telescope_pupil, wavelength=wavelength)
+                wavefront_3.electric_field = np.exp(1j * defocus_phase_3) * telescope_pupil
+
+                focal_image_1 = prop_p2f.forward(wavefront_1)
+                focal_image_2 = prop_p2f.forward(wavefront_2)
+                focal_image_3 = prop_p2f.forward(wavefront_3)
+
+                psf_list = [focal_image_1.intensity.shaped, focal_image_2.intensity.shaped, focal_image_3.intensity.shaped]
+                distance_list = [defocus_1, defocus_2, defocus_3]
+                dx_list = [focal_grid.delta[0], focal_grid.delta[0], focal_grid.delta[0]]
+
+                recovered_phase = evaluate_recovery(psf_list, distance_list, dx_list)
+                original_phase = generate_defocus_phase(influence_functions, 0)  # Assume original phase without defocus
+
+                p2v_error, rms_error = calculate_metrics(recovered_phase, original_phase, telescope_pupil.shaped)
+                results.append((defocus_1, defocus_2, defocus_3, p2v_error, rms_error))
+
+    return results
+
+results = main()
+
+==
+
+import pandas as pd
+import seaborn as sns
+
+results_df = pd.DataFrame(results, columns=['Defocus 1', 'Defocus 2', 'Defocus 3', 'P2V Error', 'RMS Error'])
+
+plt.figure(figsize=(10, 8))
+sns.heatmap(results_df.pivot('Defocus 1', 'Defocus 2', 'RMS Error'), annot=True, fmt=".2f")
+plt.title('RMS Error for Different Defocus Combinations')
+plt.xlabel('Defocus 2 (mm)')
+plt.ylabel('Defocus 1 (mm)')
+plt.show()
